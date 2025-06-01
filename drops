@@ -1,0 +1,115 @@
+import httpx
+import logging
+from typing import List, Dict, Optional
+from app.config import VROPS_URL, VROPS_USER, VROPS_PASS, VROPS_AUTH_SOURCE, VERIFY_SSL
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG)
+
+
+class VropsClient:
+    def __init__(self):
+        self.token: Optional[str] = None
+        self.base_url = VROPS_URL.rstrip("/")
+        self.verify_ssl = VERIFY_SSL
+
+    async def authenticate(self):
+        url = f"{self.base_url}/suite-api/api/auth/token/acquire"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "username": VROPS_USER,
+            "password": VROPS_PASS,
+            "authSource": VROPS_AUTH_SOURCE
+        }
+
+        async with httpx.AsyncClient(verify=self.verify_ssl) as client:
+            logger.debug(f"[AUTH REQUEST] POST {url}")
+            logger.debug(f"[AUTH REQUEST] Headers: {headers}")
+            logger.debug(f"[AUTH REQUEST] Body: {payload}")
+
+            resp = await client.post(url, json=payload, headers=headers)
+            logger.debug(f"[AUTH RESPONSE] STATUS: {resp.status_code}")
+            logger.debug(f"[AUTH RESPONSE] BODY:\n{await resp.text()}")
+
+            resp.raise_for_status()
+            data = await resp.json()
+            self.token = data.get("token")
+            if not self.token:
+                raise Exception("Token not found in auth response")
+
+    async def get_vm_to_host_mapping(self, vm_names: List[str]) -> Dict[str, str]:
+        if not self.token:
+            await self.authenticate()
+
+        headers = {
+            "Authorization": f"vRealizeOpsToken {self.token}",
+            "Accept": "application/json"
+        }
+
+        mapping = {}
+
+        async with httpx.AsyncClient(verify=self.verify_ssl) as client:
+            for vm_name in vm_names:
+                params = {
+                    "resourceKind": "VirtualMachine",
+                    "name": vm_name
+                }
+                search_url = f"{self.base_url}/suite-api/api/resources"
+
+                logger.debug(f"[SEARCH REQUEST] GET {search_url}")
+                logger.debug(f"[SEARCH REQUEST] Params: {params}")
+                logger.debug(f"[SEARCH REQUEST] Headers: {headers}")
+
+                try:
+                    search_resp = await client.get(search_url, headers=headers, params=params)
+                    logger.debug(f"[SEARCH RESPONSE] STATUS: {search_resp.status_code}")
+                    logger.debug(f"[SEARCH RESPONSE] BODY:\n{await search_resp.text()}")
+
+                    search_resp.raise_for_status()
+                    search_data = await search_resp.json()
+                    resources = search_data.get("resourceList", [])
+                except Exception as e:
+                    logger.error(f"[SEARCH] Failed for VM '{vm_name}': {e}")
+                    mapping[vm_name] = "Error searching VM"
+                    continue
+
+                if not resources:
+                    mapping[vm_name] = "VM not found"
+                    continue
+
+                vm_resource = resources[0]
+                vm_id = vm_resource.get("identifier")
+
+                # Step 2: Get relationships
+                relationship_url = f"{self.base_url}/suite-api/api/resources/{vm_id}/relationships"
+                logger.debug(f"[RELATIONSHIP REQUEST] GET {relationship_url}")
+                logger.debug(f"[RELATIONSHIP REQUEST] Headers: {headers}")
+
+                try:
+                    rel_resp = await client.get(relationship_url, headers=headers)
+                    logger.debug(f"[RELATIONSHIP RESPONSE] STATUS: {rel_resp.status_code}")
+                    logger.debug(f"[RELATIONSHIP RESPONSE] BODY:\n{await rel_resp.text()}")
+
+                    rel_resp.raise_for_status()
+                    rel_data = await rel_resp.json()
+                    relationships = rel_data.get("resourceRelationship", [])
+                except Exception as e:
+                    logger.error(f"[RELATIONSHIP] Failed for VM '{vm_name}': {e}")
+                    mapping[vm_name] = "Error retrieving relationships"
+                    continue
+
+                # Step 3: Find ESXi host
+                esxi_host = next(
+                    (rel.get("resourceName") for rel in relationships if rel.get("resourceKindKey") == "HostSystem"),
+                    None
+                )
+
+                if esxi_host:
+                    mapping[vm_name] = esxi_host
+                else:
+                    mapping[vm_name] = "ESXi host not found"
+
+        return mapping
